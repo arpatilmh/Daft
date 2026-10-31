@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     from daft.dataframe.to_torch import DaftTorchDataLoader
     from daft.execution.metadata import ExecutionMetadata
     from daft.io import DataSink
+    from daft.io.delta_lake.merge_builder import DeltaMergeBuilder
     from daft.io.sink import WriteResultType
 
 from daft.schema import Schema
@@ -1894,7 +1895,7 @@ class DataFrame:
         self,
         table: Union[str, pathlib.Path, "deltalake.DeltaTable", "UnityCatalogTable"],
         partition_cols: list[str] | None = None,
-        mode: Literal["append", "overwrite", "error", "ignore"] = "append",
+        mode: Literal["append", "overwrite", "error", "ignore", "merge"] = "append",
         schema_mode: Literal["merge", "overwrite"] | None = None,
         name: str | None = None,
         description: str | None = None,
@@ -1904,16 +1905,33 @@ class DataFrame:
         allow_unsafe_rename: bool = False,
         io_config: IOConfig | None = None,
         checkpoint: "IdempotentCommit | None" = None,
+        merge_keys: list[str] | None = None,
+        when_matched: Literal["update", "delete"] = "update",
+        when_not_matched: Literal["insert", "ignore"] = "insert",
+        allow_multiple_matches: bool | None = None,
+        merge_max_retries: int = 3,
+        merge_predicate: str | None = None,
+        when_matched_update: Mapping[str, str] | Literal["all"] | None = None,
+        when_matched_update_condition: str | None = None,
+        when_matched_delete_condition: str | None = None,
+        when_not_matched_insert: Mapping[str, str] | Literal["all"] | None = None,
+        when_not_matched_insert_condition: str | None = None,
+        merge_clauses: list[Any] | None = None,
+        merge_schema: bool = False,
     ) -> "DataFrame":
         """Writes the DataFrame to a [Delta Lake](https://docs.delta.io/latest/index.html) table, returning a new DataFrame with the operations that occurred.
 
         ``write_deltalake`` supports checkpointing via the ``checkpoint=`` parameter. For the conceptual overview, see the [Checkpointing guide](../use-case/checkpointing.md).
 
+        With ``mode="merge"``, performs a Spark-style MERGE into an **existing**
+        Delta table (find touched files → rewrite → Add+Remove commit) on the
+        Daft runner. See ``docs/design-distributed-delta-merge.md``.
+
         Args:
             table (Union[str, pathlib.Path, deltalake.DeltaTable, UnityCatalogTable]): Destination [Delta Lake Table](https://delta-io.github.io/delta-rs/api/delta_table/) or table URI to write dataframe to.
             partition_cols (List[str], optional): How to subpartition each partition further. If table exists, expected to match table's existing partitioning scheme, otherwise creates the table with specified partition columns. Defaults to None.
-            mode (str, optional): Operation mode of the write. `append` will add new data, `overwrite` will replace table with new data, `error` will raise an error if table already exists, and `ignore` will not write anything if table already exists. Defaults to `append`.
-            schema_mode (str, optional): Schema mode of the write. If set to `overwrite`, allows replacing the schema of the table when doing `mode=overwrite`. Schema mode `merge` is currently not supported.
+            mode (str, optional): Operation mode of the write. `append` will add new data, `overwrite` will replace table with new data, `error` will raise an error if table already exists, `ignore` will not write anything if table already exists, and `merge` will upsert into an existing table using ``merge_keys``. Defaults to `append`.
+            schema_mode (str, optional): Schema mode of the write. If set to `overwrite`, allows replacing the schema of the table when doing `mode=overwrite`. For ``mode="merge"``, ``schema_mode="merge"`` enables opt-in schema evolution (same as ``merge_schema=True``).
             name (str, optional): User-provided identifier for this table.
             description (str, optional): User-provided description for this table.
             configuration (Mapping[str, Optional[str]], optional): A map containing configuration options for the metadata action.
@@ -1925,9 +1943,25 @@ class DataFrame:
                 or local disk. Defaults to False.
             io_config (IOConfig, optional): configurations to use when interacting with remote storage.
             checkpoint (IdempotentCommit, optional): Bundled checkpoint store + idempotence key for an idempotent commit. When provided, the Delta commit's ``custom_metadata`` is tagged with ``daft.idempotence-key`` and retries with the same key recognize the prior attempt without producing a duplicate commit. Only ``mode='append'`` is supported. Requires the Ray runner.
+            merge_keys (List[str], optional): Equality join columns when ``mode="merge"`` (or use ``merge_predicate``).
+            when_matched (str, optional): v1 sugar for ``mode="merge"``: ``"update"`` or ``"delete"``.
+            when_not_matched (str, optional): v1 sugar: ``"insert"`` or ``"ignore"``.
+            allow_multiple_matches (bool, optional): Multi-match policy; default auto-True when matched clauses are delete-only.
+            merge_max_retries (int, optional): OCC plan+commit retries for ``mode="merge"``. Defaults to 3.
+            merge_predicate (str, optional): SQL ``ON`` predicate (``target.col = source.col``).
+            when_matched_update (dict | "all", optional): Partial/all matched UPDATE map (v2).
+            when_matched_update_condition (str, optional): Condition for the update clause.
+            when_matched_delete_condition (str, optional): Adds a matched DELETE clause with this condition.
+            when_not_matched_insert (dict | "all", optional): Insert map or insert-all (v2).
+            when_not_matched_insert_condition (str, optional): Condition for the insert clause.
+            merge_clauses (list, optional): Explicit ordered ``MergeClause`` list (v3 Spark parity).
+            merge_schema (bool, optional): Allow adding source-only columns during merge (v3).
 
         Returns:
-            DataFrame: The operations that occurred with this write.
+            DataFrame: For ``append``/``overwrite``/``error``/``ignore``, the file
+            operations that occurred. For ``mode="merge"``, a one-row summary with
+            ``version``, ``committed``, ``num_updated``, ``num_inserted``,
+            ``num_copied``, ``num_files_rewritten``, ``commit_attempts``.
 
         Note:
             This call is **blocking** and will execute the DataFrame when called.
@@ -1961,11 +1995,22 @@ class DataFrame:
             crashed attempts are not referenced by any commit but the
             bytes remain on disk.
 
+            ``mode="merge"`` requires an existing table and ``deltalake>=1.6.6``
+            when rewriting files (RemoveAction). Do not confuse with
+            ``schema_mode="merge"`` (unsupported schema evolution).
+
         Examples:
             >>> import daft
             >>> import deltalake
             >>> df = daft.from_pydict({"x": [1, 2, 3], "y": ["a", "b", "c"]})
             >>> df.write_deltalake("s3://my-bucket/my-deltalake-table")  # doctest: +SKIP
+            >>>
+            >>> # Upsert into an existing table
+            >>> df.write_deltalake(  # doctest: +SKIP
+            ...     "s3://my-bucket/my-deltalake-table",
+            ...     mode="merge",
+            ...     merge_keys=["x"],
+            ... )
             >>>
             >>> store = daft.CheckpointStore("s3://my-bucket/ckpt/")  # doctest: +SKIP
             >>> df = daft.read_parquet(
@@ -1994,8 +2039,15 @@ class DataFrame:
         )
         from daft.io.object_store_options import io_config_to_storage_options
 
-        if schema_mode == "merge":
-            raise ValueError("Schema mode' merge' is not currently supported for write_deltalake.")
+        # lowercase comparison for write mode / schema_mode
+        mode_normalized = mode.lower() if isinstance(mode, str) else mode
+        schema_mode_normalized = schema_mode.lower() if isinstance(schema_mode, str) else schema_mode
+        if schema_mode_normalized == "merge" and mode_normalized != "merge":
+            raise ValueError(
+                "schema_mode='merge' is only supported with mode='merge' (row-level MERGE schema evolution)."
+            )
+        if schema_mode_normalized == "merge" and mode_normalized == "merge":
+            merge_schema = True
 
         if parse(deltalake.__version__) < parse("0.14.0"):
             raise ValueError(f"Write delta lake is only supported on deltalake>=0.14.0, found {deltalake.__version__}")
@@ -2009,11 +2061,35 @@ class DataFrame:
                 if key.startswith("daft.idempotence-"):
                     raise ValueError(f"custom_metadata keys with prefix 'daft.idempotence-' are reserved; got: {key!r}")
 
-        if checkpoint is not None and mode != "append":
+        if checkpoint is not None and mode_normalized != "append":
             raise NotImplementedError(
                 f"write_deltalake with checkpoint=... currently supports mode='append' only; "
-                f"got mode={mode!r}. overwrite/error/ignore + checkpoint are tracked separately."
+                f"got mode={mode!r}. overwrite/error/ignore/merge + checkpoint are tracked separately."
             )
+
+        if mode_normalized == "merge":
+            return self._write_deltalake_merge(
+                table=table,
+                merge_keys=merge_keys,
+                when_matched=when_matched,
+                when_not_matched=when_not_matched,
+                allow_multiple_matches=allow_multiple_matches,
+                dynamo_table_name=dynamo_table_name,
+                allow_unsafe_rename=allow_unsafe_rename,
+                io_config=io_config,
+                max_retries=merge_max_retries,
+                merge_predicate=merge_predicate,
+                when_matched_update=when_matched_update,
+                when_matched_update_condition=when_matched_update_condition,
+                when_matched_delete_condition=when_matched_delete_condition,
+                when_not_matched_insert=when_not_matched_insert,
+                when_not_matched_insert_condition=when_not_matched_insert_condition,
+                merge_clauses=merge_clauses,
+                merge_schema=merge_schema,
+            )
+
+        if merge_keys is not None or merge_predicate is not None or merge_clauses is not None:
+            raise ValueError("merge_keys / merge_predicate / merge_clauses are only valid when mode='merge'")
 
         io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -2388,6 +2464,185 @@ class DataFrame:
                 continue
 
         raise last_err or RuntimeError(f"write_deltalake with checkpoint exhausted {max_retries} retries")
+
+    def _write_deltalake_merge(
+        self,
+        table: Union[str, pathlib.Path, "deltalake.DeltaTable", "UnityCatalogTable"],
+        merge_keys: list[str] | None,
+        when_matched: Literal["update", "delete"],
+        when_not_matched: Literal["insert", "ignore"],
+        allow_multiple_matches: bool | None,
+        dynamo_table_name: str | None,
+        allow_unsafe_rename: bool,
+        io_config: IOConfig | None,
+        max_retries: int,
+        merge_predicate: str | None = None,
+        when_matched_update: Mapping[str, str] | Literal["all"] | None = None,
+        when_matched_update_condition: str | None = None,
+        when_matched_delete_condition: str | None = None,
+        when_not_matched_insert: Mapping[str, str] | Literal["all"] | None = None,
+        when_not_matched_insert_condition: str | None = None,
+        merge_clauses: list[Any] | None = None,
+        merge_schema: bool = False,
+    ) -> "DataFrame":
+        """Implement ``write_deltalake(..., mode="merge")`` via Spark-style phases.
+
+        Args:
+            table: Existing Delta table destination.
+            merge_keys: Equality join columns (or use merge_predicate).
+            when_matched: v1 matched action sugar.
+            when_not_matched: v1 source-only action sugar.
+            allow_multiple_matches: Phase-1 multi-match policy (None = auto).
+            dynamo_table_name: Optional S3 DynamoDB lock table.
+            allow_unsafe_rename: Explicit unsafe rename flag.
+            io_config: Storage IO config.
+            max_retries: OCC plan+commit attempts.
+            merge_predicate: SQL ON predicate (v2).
+            when_matched_update: Partial/all update map (v2).
+            when_matched_update_condition: Update clause condition.
+            when_matched_delete_condition: Matched delete condition.
+            when_not_matched_insert: Insert map or all.
+            when_not_matched_insert_condition: Insert condition.
+            merge_clauses: Explicit ordered clauses (v3).
+            merge_schema: Opt-in schema evolution (v3).
+
+        Returns:
+            One-row summary DataFrame of merge metrics.
+        """
+        import deltalake
+        import pyarrow as pa
+        from deltalake.exceptions import TableNotFoundError
+
+        from daft import from_pydict
+        from daft.dependencies import unity_catalog
+        from daft.io.delta_lake.merge_commit import merge_into_dataframe
+        from daft.io.delta_lake.merge_plan import resolve_merge_plan
+        from daft.io.object_store_options import io_config_to_storage_options
+
+        plan = resolve_merge_plan(
+            merge_keys=merge_keys,
+            merge_predicate=merge_predicate,
+            when_matched=when_matched,
+            when_not_matched=when_not_matched,
+            when_matched_update=when_matched_update,
+            when_matched_update_condition=when_matched_update_condition,
+            when_matched_delete_condition=when_matched_delete_condition,
+            when_not_matched_insert=when_not_matched_insert,
+            when_not_matched_insert_condition=when_not_matched_insert_condition,
+            merge_clauses=merge_clauses,
+            allow_multiple_matches=allow_multiple_matches,
+            merge_schema=merge_schema,
+        )
+
+        io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
+
+        table_uri: str
+        storage_options: dict[str, str]
+        delta_table: deltalake.DeltaTable
+
+        if isinstance(table, deltalake.DeltaTable):
+            table_uri = table.table_uri
+            storage_options = dict(table._storage_options or {})
+            new_storage_options = io_config_to_storage_options(io_config, table_uri)
+            storage_options.update(new_storage_options or {})
+            storage_options_changed = _configure_deltalake_storage_options(
+                table_uri,
+                storage_options,
+                dynamo_table_name,
+                allow_unsafe_rename,
+                deltalake.__version__,
+            )
+            delta_table = (
+                deltalake.DeltaTable(table_uri, storage_options=storage_options) if storage_options_changed else table
+            )
+        else:
+            if isinstance(table, str):
+                table_uri = os.path.expanduser(table)
+            elif isinstance(table, pathlib.Path):
+                table_uri = str(table)
+            elif unity_catalog.module_available() and isinstance(table, unity_catalog.UnityCatalogTable):
+                table_uri = table.table_uri
+                io_config = table.io_config
+            else:
+                raise ValueError(f"Expected table to be a path or a DeltaTable, received: {type(table)}")
+
+            if io_config is None:
+                raise ValueError(
+                    "io_config was not provided to write_deltalake(mode='merge') "
+                    "and could not be retrieved from defaults."
+                )
+
+            storage_options = io_config_to_storage_options(io_config, table_uri) or {}
+            _configure_deltalake_storage_options(
+                table_uri,
+                storage_options,
+                dynamo_table_name,
+                allow_unsafe_rename,
+                deltalake.__version__,
+            )
+            try:
+                delta_table = deltalake.DeltaTable(table_uri, storage_options=storage_options)
+            except TableNotFoundError as exc:
+                raise TableNotFoundError(
+                    f"write_deltalake(mode='merge') requires an existing Delta table at {table_uri!r}"
+                ) from exc
+
+        # Phase-1 + phase-2 on Daft runner; phase-3 commit via delta-rs.
+        merge_result = merge_into_dataframe(
+            self,
+            delta_table,
+            list(plan.merge_keys),
+            plan=plan,
+            storage_options=storage_options,
+            io_config=io_config,
+            max_retries=max_retries,
+        )
+
+        return from_pydict(
+            {
+                "version": pa.array([merge_result.version], type=pa.int64()),
+                "committed": pa.array([merge_result.committed], type=pa.bool_()),
+                "num_updated": pa.array([merge_result.rewritten.num_updated], type=pa.int64()),
+                "num_inserted": pa.array([merge_result.rewritten.num_inserted], type=pa.int64()),
+                "num_copied": pa.array([merge_result.rewritten.num_copied], type=pa.int64()),
+                "num_deleted": pa.array([merge_result.rewritten.num_deleted], type=pa.int64()),
+                "num_files_rewritten": pa.array([len(merge_result.rewritten.remove_relative_paths)], type=pa.int64()),
+                "commit_attempts": pa.array([merge_result.commit_attempts], type=pa.int64()),
+            }
+        )
+
+    @DataframePublicAPI
+    def merge_into_deltalake(
+        self,
+        table: Union[str, pathlib.Path, "deltalake.DeltaTable", "UnityCatalogTable"],
+        *,
+        io_config: IOConfig | None = None,
+        dynamo_table_name: str | None = None,
+        allow_unsafe_rename: bool = False,
+        merge_max_retries: int = 3,
+    ) -> "DeltaMergeBuilder":
+        """Start a fluent Spark-style Delta MERGE builder (v3).
+
+        Args:
+            table: Existing Delta table destination.
+            io_config: Storage IO config.
+            dynamo_table_name: Optional DynamoDB lock table.
+            allow_unsafe_rename: Explicit unsafe rename flag.
+            merge_max_retries: OCC retries.
+
+        Returns:
+            ``DeltaMergeBuilder`` for chaining ``.on(...).when_matched_*(...).execute()``.
+        """
+        from daft.io.delta_lake.merge_builder import DeltaMergeBuilder
+
+        return DeltaMergeBuilder(
+            self,
+            table,
+            io_config=io_config,
+            dynamo_table_name=dynamo_table_name,
+            allow_unsafe_rename=allow_unsafe_rename,
+            merge_max_retries=merge_max_retries,
+        )
 
     @DataframePublicAPI
     def write_sink(self, sink: "DataSink[WriteResultType]") -> "DataFrame":

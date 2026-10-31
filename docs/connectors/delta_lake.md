@@ -90,6 +90,38 @@ Daft supports multiple write modes. See the API docs for [`df.write_deltalake()`
 
 When writing Delta Lake tables to S3, Daft relies on the native conditional write support in  `deltalake` versions >=0.23.0. DynamoDB locking is not required by default for AWS S3 writes. To explicitly use a DynamoDB locking provider, pass `dynamo_table_name="..."` to [`df.write_deltalake()`][daft.DataFrame.write_deltalake]. For deltalake versions less than 0.23.0, if dynamo_table_name is not provided and allow_unsafe_rename is False, ValueError exception will be raised.
 
+## Merge into Delta Lake (prototype)
+
+Use [`df.write_deltalake()`][daft.DataFrame.write_deltalake] with **`mode="merge"`** to upsert into an **existing** Delta table (Spark-style find-touched → rewrite → Add+Remove commit):
+
+=== "🐍 Python"
+
+    ```python
+    import daft
+
+    source = daft.from_pydict({"id": [1, 99], "val": ["updated", "new"]})
+    summary = source.write_deltalake(
+        "some-table",
+        mode="merge",
+        merge_keys=["id"],
+        # when_matched="update",          # default
+        # when_not_matched="insert",      # or "ignore"
+    )
+    summary.show()
+    ```
+
+`merge_keys` is required for `mode="merge"`. This is unrelated to `schema_mode="merge"` (schema evolution), which remains unsupported.
+
+**API roadmap (Spark parity is the end state):**
+
+| Version | Status | Covers |
+|---------|--------|--------|
+| **v1** (now) | Prototype | Equality upsert: update-all matched + insert/ignore |
+| **v2** | Planned | `ON` predicate, partial updates, matched delete, clause conditions; distributed rewrite |
+| **v3** | Planned | Full Spark / delta-rs clause parity (multi-clause, not-matched-by-source, schema evolution) |
+
+Requires `deltalake>=1.6.6` for rewrite commits. Phases 1–2 currently run in-process after `to_arrow()`. Details: [`docs/design-distributed-delta-merge.md`](../design-distributed-delta-merge.md).
+
 ## Checkpointing
 
 Daft supports idempotent writes to Delta Lake via the `checkpoint=` parameter on [`df.write_deltalake()`][daft.DataFrame.write_deltalake]. Retries of the same logical commit — after a crash, a transient catalog error, or a deliberate re-invocation — produce the same Delta state without duplicate commits. See the [Checkpointing user guide](../use-case/checkpointing.md) for concepts; the sections below cover Delta-specific behavior.
